@@ -1,0 +1,73 @@
+import json
+import boto3
+import time
+
+textract = boto3.client('textract', region_name='us-east-1')
+
+def get_textract_results(job_id):
+    pages = []
+    next_token = None
+    extracted_text = []
+
+    while True:
+        if next_token:
+            response = textract.get_document_text_detection(JobId=job_id, NextToken=next_token)
+        else:
+            response = textract.get_document_text_detection(JobId=job_id)
+
+        status = response['JobStatus']
+        print(f"Job status for {job_id}: {status}")
+
+        if status == 'SUCCEEDED':
+            # Extract only lines of text
+            for block in response.get("Blocks", []):
+                if block["BlockType"] == "LINE":
+                    extracted_text.append(block["Text"])
+        elif status in ['FAILED', 'PARTIAL_SUCCESS', 'STOPPED']:
+            print(f"Job {job_id} did not succeed.")
+            return None
+        else:
+            print("Job still in progress... waiting.")
+            time.sleep(5)
+            continue
+
+        if 'NextToken' in response:
+            next_token = response['NextToken']
+        else:
+            break
+
+    # Join the text lines into a single string
+    return "\n".join(extracted_text)
+
+
+def lambda_handler(event, context):
+    print("Received SQS Event:", json.dumps(event))
+
+    for record in event.get('Records', []):
+        try:
+            # Parse SNS-wrapped SQS message
+            sns_payload = json.loads(record['body'])
+            message = json.loads(sns_payload['Message'])
+
+            job_id = message['jobId']
+            bucket = message['bucketName']
+            filename = message['filename']
+
+            print(f"Processing Textract Job: {job_id} | File: {filename} in Bucket: {bucket}")
+
+            result = get_textract_results(job_id)
+
+            if result:
+                print("Textract results retrieved successfully.")
+                print(result)
+            else:
+                print("Textract job did not succeed or returned no result.")
+
+        except Exception as e:
+            print(f"Error processing record: {e}")
+            continue
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Textract processing completed.')
+    }
