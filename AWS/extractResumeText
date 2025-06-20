@@ -1,73 +1,148 @@
-import json
-import boto3
 import time
-
+import boto3
+import json
 textract = boto3.client('textract', region_name='us-east-1')
+bedrock = boto3.client('bedrock-runtime')
 
-def get_textract_results(job_id):
-    pages = []
+def get_textract_results(job_id, max_retries=5, wait_interval=2):
+    attempt = 0
+    while attempt < max_retries:
+        response = textract.get_document_text_detection(JobId=job_id)
+        status = response.get("JobStatus")
+        print(f"Attempt {attempt + 1} - Job status: {status}")
+
+        if status == "SUCCEEDED":
+            break
+        elif status in ["FAILED", "PARTIAL_SUCCESS", "STOPPED"]:
+            print(f"Textract job failed with status: {status}")
+            return []
+        else:
+            time.sleep(wait_interval)
+            attempt += 1
+    else:
+        print("Textract job not ready after max retries.")
+        return []
+
+    # Now fetch all pages
+    text_lines = []
     next_token = None
-    extracted_text = []
-
     while True:
         if next_token:
             response = textract.get_document_text_detection(JobId=job_id, NextToken=next_token)
         else:
             response = textract.get_document_text_detection(JobId=job_id)
 
-        status = response['JobStatus']
-        print(f"Job status for {job_id}: {status}")
+        for block in response.get("Blocks", []):
+            if block.get("BlockType") == "LINE":
+                text_lines.append(block.get("Text"))
 
-        if status == 'SUCCEEDED':
-            # Extract only lines of text
-            for block in response.get("Blocks", []):
-                if block["BlockType"] == "LINE":
-                    extracted_text.append(block["Text"])
-        elif status in ['FAILED', 'PARTIAL_SUCCESS', 'STOPPED']:
-            print(f"Job {job_id} did not succeed.")
-            return None
-        else:
-            print("Job still in progress... waiting.")
-            time.sleep(5)
-            continue
-
-        if 'NextToken' in response:
-            next_token = response['NextToken']
-        else:
+        next_token = response.get("NextToken")
+        if not next_token:
             break
 
-    # Join the text lines into a single string
-    return "\n".join(extracted_text)
+    return text_lines
 
+def get_completion(prompt):
+    try:
+        response = bedrock.invoke_model(
+            modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+            contentType="application/json",
+            accept="application/json",
+            body=json.dumps({
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                "max_tokens": 1000,
+                "temperature": 0.2
+            })
+        )
+        result = json.loads(response["body"].read())
+        return result.get("content", "")
+    except Exception as e:
+        print("Error in Bedrock model invocation:", e)
+        return ""
+
+
+def get_entity(text):
+    listofparameters = ['education', 'experience', 'skills', 'projects', 'certifications']
+
+    description_of_parameters = {
+        'education': 'Capture degree or diploma name, field of study, institution, and duration (years or present if ongoing). Accept alternate header terms such as "Academic Background", "Studies" or "Education & Training".',
+        'experience': 'Each entry must include job title, company/organization, duration, and list of key responsibilities or achievements. Treat "internships", "co-ops", and "freelance" work as valid experience.',
+        'skills': 'Produce a flat list of individual skills. Include any explicitly listed soft skills or technical skills. Normalize duplicates and remove obvious filler words.',
+        'projects': 'Each entry must include the project title, technology stack or tools if mentioned, and a brief description. Accept capstone projects, personal projects, hackathon projects, or academic projects.',
+        'certifications': 'Each entry must include the certificate name, issuing organization, and issue or expiry date if present. Accept licenses and verified badges as certifications.'
+    }
+
+    prompt = f"""
+    You are a resume parser.
+
+    Extract the following entities from the resume text delimited by triple backticks:
+    ```{text}```
+
+    Entities to extract: ```{json.dumps(listofparameters)}```
+
+    Refer to this parameter description dictionary:
+    ```{json.dumps(description_of_parameters, indent=2)}```
+
+    Return a valid JSON object with these keys:
+    education, experience, skills, projects, certifications
+
+    Assign an empty list [] for any key with no value.
+    Return only JSON. No explanation.
+    """
+
+    llm_response = get_completion(prompt)
+    try:
+        return json.loads(llm_response)
+    except Exception as e:
+        print("Failed to parse JSON from LLM:", e)
+        return {
+            "education": [],
+            "experience": [],
+            "skills": [],
+            "projects": [],
+            "certifications": []
+        }
 
 def lambda_handler(event, context):
     print("Received SQS Event:", json.dumps(event))
 
     for record in event.get('Records', []):
         try:
-            # Parse SNS-wrapped SQS message
-            sns_payload = json.loads(record['body'])
-            message = json.loads(sns_payload['Message'])
+            body = json.loads(record['body'])
+            sns_message = json.loads(body['Message'])  # important: double JSON decode
 
-            job_id = message['jobId']
-            bucket = message['bucketName']
-            filename = message['filename']
+            job_id = sns_message['JobId']
+            job_status = sns_message['Status']
+            print(job_status)
+            if job_status != 'SUCCEEDED':
+                print(f"WARNING: Skipping processing for Textract job {job_id} with status: {job_status}. Only SUCCEEDED jobs are processed by this handler.")
+                continue
 
-            print(f"Processing Textract Job: {job_id} | File: {filename} in Bucket: {bucket}")
+            bucket = sns_message['DocumentLocation']['S3Bucket']
+            filename = sns_message['DocumentLocation']['S3ObjectName']
 
-            result = get_textract_results(job_id)
+            print(f"Processing job {job_id} for file {filename} in bucket {bucket}")
 
-            if result:
-                print("Textract results retrieved successfully.")
-                print(result)
-            else:
-                print("Textract job did not succeed or returned no result.")
+            text_lines = get_textract_results(job_id)
+            if not text_lines:
+                print(f"WARNING: No text extracted by Textract for job {job_id} from file {filename}. Skipping LLM processing for this record.")
+                continue
+            resume_text = "\n".join(text_lines)
+            structured_info = get_entity(resume_text)
+            print(f"SUCCESS: Successfully processed job {job_id}. Extracted Entities: {json.dumps(structured_info, indent=2)}")
 
         except Exception as e:
             print(f"Error processing record: {e}")
-            continue
-
+            return {
+                'statusCode': 500,
+                'body': json.dumps({"error": str(e)})
+            }
     return {
         'statusCode': 200,
-        'body': json.dumps('Textract processing completed.')
+        'body': json.dumps("Processing completed.")
     }
